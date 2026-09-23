@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: stripe-checker
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: BUY_URL
+        value: https://buy.stripe.com/28o2apdMBcTa69G3cf
+      - key: BILLING_EMAIL
+        value: gfdgdfigjdogj@gmail.com
+      - key: BILLING_COUNTRY
+        value: US
+      - key: REQUEST_TIMEOUT
+        value: "30"
