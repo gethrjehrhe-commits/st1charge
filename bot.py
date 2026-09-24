@@ -546,7 +546,9 @@ def check_card_str(cc_str, proxy_url=None, debug=False):
 # ═══════════════════════════════════════════════════════════════════════════
 try:
     from flask import Flask, request, jsonify
-        app = Flask(__name__)
+
+    app = Flask(__name__)
+
     # Load proxies at import time (runs once when gunicorn loads the app)
     load_proxy_pool()
 
